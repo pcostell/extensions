@@ -16,6 +16,11 @@
 
 import config from "./config";
 import * as functions from "firebase-functions";
+import {
+  onDocumentWritten,
+  FirestoreEvent,
+} from "firebase-functions/v2/firestore";
+const { onTaskDispatched } = require("firebase-functions/v2/tasks");
 import * as admin from "firebase-admin";
 import { getExtensions } from "firebase-admin/extensions";
 import { getFunctions } from "firebase-admin/functions";
@@ -32,6 +37,17 @@ import * as logs from "./logs";
 import * as events from "./events";
 import { getChangeType, getDocumentId, resolveWildcardIds } from "./util";
 
+// Hard coded settings because the config variables are only accessible at function
+// runtime and these are being used at deploy time.
+const PROJECT_ID = "";
+const DATABASE_ID = "";
+// Should match config.location;
+const DB_LOCATION = "";
+// Location is either the location of the database if regional or if the database is
+// multiregional use us-central1 for nam5 and europe-west3 for eur3.
+const LOCATION = DB_LOCATION;
+const DOCUMENT_PATH = "";
+
 const eventTrackerConfig = {
   tableId: config.tableId,
   datasetId: config.datasetId,
@@ -47,7 +63,9 @@ const eventTrackerConfig = {
   wildcardIds: config.wildcardIds,
   bqProjectId: config.bqProjectId,
   useNewSnapshotQuerySyntax: config.useNewSnapshotQuerySyntax,
-  skipInit: true,
+  // Set to false in order to trigger BQ resource creation. After that, set to
+  // true and redeploy to avoid unnecessary calls to BigQuery.
+  skipInit: false,
   kmsKeyName: config.kmsKeyName,
 };
 
@@ -63,41 +81,33 @@ if (admin.apps.length === 0) {
 
 events.setupEventChannel();
 
-export const syncBigQuery = functions.tasks
-  .taskQueue()
-  .onDispatch(
-    async ({ context, changeType, documentId, data, oldData }, ctx) => {
-      const update = {
-        timestamp: context.timestamp, // This is a Cloud Firestore commit timestamp with microsecond precision.
-        operation: changeType,
-        documentName: context.resource.name,
-        documentId: documentId,
-        pathParams: config.wildcardIds ? context.params : null,
-        eventId: context.eventId,
-        data,
-        oldData,
-      };
+export const syncbigquery = onTaskDispatched(
+  { region: LOCATION, retry: true },
+  async (request) => {
+    /** Record the chnages in the change tracker */
+    await eventTracker.record([{ ...request.data }]);
 
-      /** Record the chnages in the change tracker */
-      await eventTracker.record([{ ...update }]);
+    /** Send an event Arc update , if configured */
+    await events.recordSuccessEvent({
+      subject: request.data.documentId,
+      data: {
+        ...request.data,
+      },
+    });
 
-      /** Send an event Arc update , if configured */
-      await events.recordSuccessEvent({
-        subject: documentId,
-        data: {
-          ...update,
-        },
-      });
+    logs.complete();
+  }
+);
 
-      logs.complete();
-    }
-  );
-
-export const fsexportbigquery = functions
-  .runWith({ failurePolicy: true })
-  .firestore.database(config.databaseId)
-  .document(config.collectionPath)
-  .onWrite(async (change, context) => {
+export const fsexportbigquery = onDocumentWritten(
+  {
+    document: DOCUMENT_PATH,
+    database: DATABASE_ID,
+    region: DB_LOCATION,
+    retry: true,
+  },
+  async (event) => {
+    const change = event.data;
     logs.start();
     const changeType = getChangeType(change);
     const documentId = getDocumentId(change);
@@ -130,38 +140,30 @@ export const fsexportbigquery = functions
         changeType,
         before: { data: change.before.data() },
         after: { data: change.after.data() },
-        context: context.resource,
       });
     } catch (err) {
       logs.error(false, "Failed to record start event", err, null, null);
       throw err;
     }
 
+    const eventData = {
+      timestamp: event.time, // This is a Cloud Firestore commit timestamp with microsecond precision.
+      operation: changeType,
+      documentName: event.document,
+      documentId: documentId,
+      pathParams: config.wildcardIds ? event.params : null,
+      eventId: event.id,
+      data: serializedData,
+      oldData: serializedOldData,
+    };
+
     try {
       const queue = getFunctions().taskQueue(
-        `locations/${config.location}/functions/syncBigQuery`,
-        config.instanceId
+        `locations/${config.location}/functions/syncbigquery`
       );
 
-      await queue.enqueue({
-        context,
-        changeType,
-        documentId,
-        data: serializedData,
-        oldData: serializedOldData,
-      });
+      await queue.enqueue(eventData);
     } catch (err) {
-      const event = {
-        timestamp: context.timestamp, // This is a Cloud Firestore commit timestamp with microsecond precision.
-        operation: changeType,
-        documentName: context.resource.name,
-        documentId: documentId,
-        pathParams: config.wildcardIds ? context.params : null,
-        eventId: context.eventId,
-        data: serializedData,
-        oldData: serializedOldData,
-      };
-
       await events.recordErrorEvent(err as Error);
       // Only log the error once here
       if (!err.logged) {
@@ -169,7 +171,7 @@ export const fsexportbigquery = functions
           config.logFailedExportData,
           "Failed to enqueue task to syncBigQuery",
           err,
-          event,
+          eventData,
           eventTrackerConfig
         );
       }
@@ -177,119 +179,5 @@ export const fsexportbigquery = functions
     }
 
     logs.complete();
-  });
-
-export const setupBigQuerySync = functions.tasks
-  .taskQueue()
-  .onDispatch(async () => {
-    /** Setup runtime environment */
-    const runtime = getExtensions().runtime();
-
-    /** Init the BigQuery sync */
-    await eventTracker.initialize();
-
-    await runtime.setProcessingState(
-      "PROCESSING_COMPLETE",
-      "Sync setup completed"
-    );
-  });
-
-export const initBigQuerySync = functions.tasks
-  .taskQueue()
-  .onDispatch(async () => {
-    /** Setup runtime environment */
-    const runtime = getExtensions().runtime();
-
-    /** Init the BigQuery sync */
-    await eventTracker.initialize();
-
-    /** Run Backfill */
-    if (false) {
-      await getFunctions()
-        .taskQueue(
-          `locations/${config.location}/functions/fsimportexistingdocs`,
-          config.instanceId
-        )
-        .enqueue({ offset: 0, docsCount: 0 });
-      return;
-    }
-
-    await runtime.setProcessingState(
-      "PROCESSING_COMPLETE",
-      "Sync setup completed"
-    );
-    return;
-  });
-
-exports.fsimportexistingdocs = functions.tasks
-  .taskQueue()
-  .onDispatch(async (data, context) => {
-    const runtime = getExtensions().runtime();
-    await runtime.setProcessingState(
-      "PROCESSING_COMPLETE",
-      "Completed. No existing documents imported into BigQuery."
-    );
-    return;
-
-    // if (!config.doBackfill || !config.importCollectionPath) {
-    //   await runtime.setProcessingState(
-    //     "PROCESSING_COMPLETE",
-    //     "Completed. No existing documents imported into BigQuery."
-    //   );
-    //   return;
-    // }
-
-    // const offset = (data["offset"] as number) ?? 0;
-    // const docsCount = (data["docsCount"] as number) ?? 0;
-
-    // const query = config.useCollectionGroupQuery
-    //   ? getFirestore(config.databaseId).collectionGroup(
-    //       config.importCollectionPath.split("/")[
-    //         config.importCollectionPath.split("/").length - 1
-    //       ]
-    //     )
-    //   : getFirestore(config.databaseId).collection(config.importCollectionPath);
-
-    // const snapshot = await query
-    //   .offset(offset)
-    //   .limit(config.docsPerBackfill)
-    //   .get();
-
-    // const rows = snapshot.docs.map((d) => {
-    //   return {
-    //     timestamp: new Date().toISOString(),
-    //     operation: ChangeType.IMPORT,
-    //     documentName: `projects/${config.bqProjectId}/databases/(default)/documents/${d.ref.path}`,
-    //     documentId: d.id,
-    //     eventId: "",
-    //     pathParams: resolveWildcardIds(config.importCollectionPath, d.ref.path),
-    //     data: eventTracker.serializeData(d.data()),
-    //   };
-    // });
-    // try {
-    //   await eventTracker.record(rows);
-    // } catch (err: any) {
-    //   /** If configured, event tracker wil handle failed rows in a backup collection  */
-    //   functions.logger.log(err);
-    // }
-    // if (rows.length == config.docsPerBackfill) {
-    //   // There are more documents to import - enqueue another task to continue the backfill.
-    //   const queue = getFunctions().taskQueue(
-    //     `locations/${config.location}/functions/fsimportexistingdocs`,
-    //     config.instanceId
-    //   );
-    //   await queue.enqueue({
-    //     offset: offset + config.docsPerBackfill,
-    //     docsCount: docsCount + rows.length,
-    //   });
-    // } else {
-    //   // We are finished, set the processing state to report back how many docs were imported.
-    //   runtime.setProcessingState(
-    //     "PROCESSING_COMPLETE",
-    //     `Successfully imported ${
-    //       docsCount + rows.length
-    //     } documents into BigQuery`
-    //   );
-    // }
-    // await events.recordCompletionEvent({ context });
-  });
+  }
+);
